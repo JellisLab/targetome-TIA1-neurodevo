@@ -1,0 +1,254 @@
+---
+title: "Enrichment of TIA1 based on RIP-seq during ESC-derived neurodevelopment"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(DESeq2)
+library(dplyr)
+```
+
+Current directory to generate data paths
+```{r}
+current_dir = getwd()
+```
+
+
+# Gene level analysis
+
+
+Upload counts data. Sum counts from all detected pA sites to get gene counts.
+```{r}
+counts_path = paste(current_dir, 
+                    "/data/counts.csv", 
+                    sep = "")
+counts = read.csv(counts_path, header = TRUE)
+gene.counts = counts %>%
+               filter(site_type != "intergenic") %>%
+               select(-chr, -region_start, -region_end,
+                      -strand, -site_type) %>%
+               group_by(gene) %>%
+               summarise_all(sum, na.rm = T)
+```
+
+Prepare matrix for DESeq
+```{r}
+# Remove names of the genes 
+counts.data = gene.counts[,c(2:ncol(gene.counts))]
+
+# Convert counts dataframe to matrix and append gene names
+counts.data = as.matrix(counts.data)
+row.names(counts.data) = gene.counts$gene
+```
+
+Estimate enrichments of (TIA1 RIP over Input) and (TIA1 RIP over IgG RIP)
+We are using DESeq2 pairwise method
+```{r}
+estimate_enrichment <- function(counts_tbl, condition_top, condition_bottom, yield_scaling) {
+  samples.list = list()
+  for (celltype in c("ESC", "NPC", "Neu")) {
+    # Indices for data columns
+    RIP_indices = grepl(x = colnames(counts_tbl), 
+                        pattern = paste(celltype, "[0-9]", condition_top, sep = "_"))
+    Input_indices = grepl(x = colnames(counts_tbl), 
+                          pattern = paste(celltype, "[0-9]", condition_bottom, sep = "_"))
+    
+    # Select data for each assay and celltype
+    RIP.subset = counts_tbl[, RIP_indices]
+    Input.subset = counts_tbl[, Input_indices]
+    
+    # Remove broken IgG samples in NPC and Neu
+    # Identified based on PCA and RNA concentrations in the samples
+    replicates_number = 3
+    if (celltype == "NPC" & condition_bottom == "IgG") {
+      RIP.subset = RIP.subset[, 2:3]
+      Input.subset = Input.subset[, 2:3]
+      replicates_number = 2
+    }
+    if (celltype == "Neu" & condition_bottom == "IgG") {
+      RIP.subset = RIP.subset[, 1:2]
+      Input.subset = Input.subset[, 1:2]
+      replicates_number = 2
+    }
+    
+    # Merge RIP and Input data
+    subset = cbind(Input.subset, RIP.subset)
+    
+    print(head(subset))
+    
+    # Prepare samples for DESeq
+    samples = colnames(subset)
+    column.data = data.frame(row.names = samples,
+                             replicate = gsub(paste(celltype, "_", "IgG", 
+                                                    "Input", "TIA1", sep = "|"), 
+                                              "", samples),
+                             treatment = gsub(paste(celltype, "_", "[0-9]_", sep = "|"),
+                                              "", samples)) %>%
+                  mutate(replicate = factor(replicate),
+                         treatment = factor(treatment, levels = c(condition_bottom,
+                                                                  condition_top)))
+    
+    # Create DESeqDataSet object from matrix with counts
+    dds = DESeq2::DESeqDataSetFromMatrix(countData = subset,
+                                         colData = column.data,
+                                         design =~ replicate + treatment)
+    
+    if (condition_bottom == "IgG") {
+      RNA_yield_ratios = c(rep(yield_scaling, replicates_number),
+                           rep(1, replicates_number))
+      raw_scaling = DESeq2::estimateSizeFactorsForMatrix(subset)
+      normed_scaling = raw_scaling * RNA_yield_ratios
+      DESeq2::sizeFactors(dds) = normed_scaling
+    }
+    
+    # Run DESeq pipeline
+    dds = DESeq2::DESeq(dds)
+    
+    # Estimate enrichments
+    res = data.frame(DESeq2::results(dds)) %>%
+          mutate(gene = row.names(.)) %>%
+          select(gene, log2FoldChange, padj)
+    
+    # Save estimates
+    samples.list[[celltype]] = res
+  }
+
+
+  RIP_enrichment = Reduce(function(...) merge(..., by='gene', all.x=TRUE, all.y=TRUE, 
+                                              suffixes = ),
+                          samples.list)
+  listed_colnames = lapply(X = names(samples.list),
+                         FUN = function(x) paste0(c(paste("log2_",
+                                                          condition_top, "_", 
+                                                          condition_bottom, "_",
+                                                          sep = ""), "padj_"), x))
+  colnames(RIP_enrichment) = c("gene", 
+                               unlist(listed_colnames))
+
+  return(RIP_enrichment)
+}
+
+# Notice we use adjusted DESeq scaling factor for TIA1 and IgG comparison.
+# This is to account for much lower RNA yield in IgG vs TIA1
+# immunoprecipitations.
+RIP_res = estimate_enrichment(counts.data, "TIA1", "Input", 1)
+IgG_res = estimate_enrichment(counts.data, "IgG", "Input", 1)
+TIA1_IgG_res = estimate_enrichment(counts.data, "TIA1", "IgG", 1.5)
+
+# Save intermediate tables if desired
+write.csv(x = RIP_res, row.names = FALSE, 
+          file = paste(current_dir, 
+                       "/data/RIP_enrichments_genes.csv", 
+                       sep = ""))
+write.csv(x = IgG_res, row.names = FALSE,
+          file = paste(current_dir, 
+                       "/data/IgG_enrichments_genes.csv", 
+                       sep = ""))
+write.csv(x = TIA1_IgG_res, row.names = FALSE,
+          file = paste(current_dir, 
+                       "/data/TIA1_IgG_enrichments_genes.csv", 
+                       sep = ""))
+```
+
+Check for enrichment of TIA1 over IgG
+```{r}
+calculate_beads_bias <- function(sample, replicates_data, enrichment_thresholds) {
+  # Choose columns corresponding to the sample
+  subset = select(replicates_data, contains(sample))
+  
+  # TIA1 IP is enriched  over IgG if:
+  # a) fold change is large enough
+  # b) padj is small enough
+  threshold = enrichment_thresholds[[sample]]
+  FC_filter = subset[, 1] > threshold
+  padj_filter = subset[, 2] < 0.05
+  combined_filter = FC_filter & padj_filter
+  combined_filter = gsub(TRUE, "Enriched", combined_filter)
+  combined_filter = gsub("FALSE", "Noise", combined_filter)
+  
+  # Construct output dataframe
+  output = data.frame(row.names = c(1:length(combined_filter)))
+  output[paste("TIA1", "IgG", sample, sep = "_")]  = combined_filter
+  
+  return(output)
+}
+
+celltypes = c('ESC', 'NPC', 'Neu')
+thresholds = list('ESC' = 0.58,
+                  'NPC' = 0.58,
+                  'Neu' = 0.58)
+mean.list = lapply(X = celltypes,
+                   FUN = calculate_beads_bias, 
+                   TIA1_IgG_res, thresholds)
+TIA1_IgG_stats = Reduce(x = mean.list, f = cbind) %>%
+                 mutate(gene = TIA1_IgG_res$gene)
+TIA1_IgG_stats[is.na(TIA1_IgG_stats)] = "Noise"
+
+# Save table if desired
+write.csv(TIA1_IgG_stats, row.names = FALSE,
+          file = paste(current_dir, 
+                       "/data/TIA1_IgG_enrichments_genes_stats.csv", 
+                       sep = ""))
+```
+
+Average mRNA abundance
+```{r}
+calculate_genes_stats <- function(sample, replicates_data) {
+  # Choose columns corresponding to the sample
+  sample.replicates = select(replicates_data, contains(sample))
+  
+  # Normalize samples by DESeq
+  scaling_factor = DESeq2::estimateSizeFactorsForMatrix(sample.replicates)
+  sample.replicates = sweep(sample.replicates, 2, scaling_factor, "/")
+  
+  # Calculate standard deviation and mean
+  rep_sd   = apply(X = sample.replicates, MARGIN = 1, sd, na.rm = TRUE)
+  rep_mean = rowMeans(sample.replicates, na.rm = TRUE)
+  
+  # Extract name of a sample
+  column.name = colnames(sample.replicates)[1]
+  sample.name = strsplit(column.name, split = '_[1-9]')[[1]]
+  
+  # Construct output dataframe
+  output = data.frame(row.names = c(1:length(rep_sd)))
+  output[paste(sample.name, 'mean', sep='.')]  = rep_mean
+  output[paste(sample.name, 'sd', sep='.')]    = rep_sd
+  output[paste(sample.name, 'noise', sep='.')] = rep_sd/rep_mean
+  
+  return(output)
+}
+
+celltypes = c('ESC', 'NPC', 'Neu')
+colnames(gene.counts) = gsub("_Input", "", colnames(gene.counts ))
+mean.list = lapply(X = celltypes, 
+                   FUN = calculate_genes_stats, 
+                   gene.counts %>% select(-contains("IgG"), -contains("TIA1")))
+gene_stats = Reduce(x = mean.list, f = cbind) %>%
+             mutate(gene = gene.counts$gene) %>%
+             select(gene, contains("mean"), contains("sd"), contains("noise"))
+
+# Save table if desired
+write.csv(gene_stats, row.names = FALSE,
+          file = paste(current_dir, 
+                       "/data/genes_stats.csv", 
+                       sep = ""))
+```
+
+Combine data
+```{r}
+full_stats = full_join(RIP_res, TIA1_IgG_stats, by = "gene") %>%
+             full_join(gene_stats, by = "gene")
+
+write.csv(full_stats, row.names = FALSE,
+          file = paste(current_dir, 
+                       "/data/RIP_all_data.csv", 
+                       sep = ""))
+```
+
